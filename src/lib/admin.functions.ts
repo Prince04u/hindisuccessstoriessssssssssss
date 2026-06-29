@@ -31,10 +31,31 @@ export const adminListArticles = createServerFn({ method: "GET" })
   .inputValidator((d) => z.object({ status: z.string().optional() }).parse(d))
   .handler(async ({ data, context }) => {
     await ensureAdmin(context.supabase, context.userId);
-    let q: any = context.supabase.from("articles").select("id, slug, title, status, view_count, created_at, published_at, link_policy, is_featured, author:profiles!articles_author_id_fkey(username, display_name)").order("created_at", { ascending: false });
+
+    // 1. Articles fetch karo (embed ke bina)
+    let q: any = context.supabase
+      .from("articles")
+      .select("id, slug, title, status, view_count, created_at, published_at, link_policy, is_featured, author_id")
+      .order("created_at", { ascending: false });
     if (data.status) q = q.eq("status", data.status);
-    const { data: rows } = await q.limit(100);
-    return rows ?? [];
+    const { data: rows, error: aErr } = await q.limit(100);
+    if (aErr) throw new Error(aErr.message);
+    if (!rows || rows.length === 0) return [];
+
+    // 2. Authors alag se fetch karo
+    const authorIds = [...new Set(rows.map((r: any) => r.author_id).filter(Boolean))];
+    const { data: profiles } = await context.supabase
+      .from("profiles")
+      .select("id, username, display_name")
+      .in("id", authorIds);
+
+    const profileMap = new Map((profiles ?? []).map((p: any) => [p.id, p]));
+
+    // 3. Merge karo
+    return rows.map((r: any) => ({
+      ...r,
+      author: profileMap.get(r.author_id) ?? null,
+    }));
   });
 
 export const adminUpdateArticle = createServerFn({ method: "POST" })
