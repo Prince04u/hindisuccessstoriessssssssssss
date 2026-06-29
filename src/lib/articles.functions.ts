@@ -2,38 +2,64 @@ import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
 import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 
-const ARTICLE_LIST = `
+// Columns for list views (NO embeds — joins fail on Cloudflare Workers' supabase client)
+const ARTICLE_LIST_COLS = `
   id, slug, title, subtitle, excerpt, cover_image_url, status, reading_time,
   view_count, like_count, comment_count, published_at, created_at, is_featured,
-  category:categories(id, slug, name),
-  author:profiles!articles_author_id_fkey(id, username, display_name, avatar_url, bio)
+  category_id, author_id
 `;
+
+// Helper: attach category + author to a list of articles via separate queries
+async function attachMeta(sb: any, rows: any[]) {
+  if (!rows || rows.length === 0) return [];
+  const authorIds = [...new Set(rows.map((r) => r.author_id).filter(Boolean))];
+  const categoryIds = [...new Set(rows.map((r) => r.category_id).filter(Boolean))];
+
+  const [{ data: authors }, { data: categories }] = await Promise.all([
+    authorIds.length
+      ? sb.from("profiles").select("id, username, display_name, avatar_url, bio").in("id", authorIds)
+      : Promise.resolve({ data: [] }),
+    categoryIds.length
+      ? sb.from("categories").select("id, slug, name").in("id", categoryIds)
+      : Promise.resolve({ data: [] }),
+  ]);
+
+  const authorMap = new Map((authors ?? []).map((a: any) => [a.id, a]));
+  const categoryMap = new Map((categories ?? []).map((c: any) => [c.id, c]));
+
+  return rows.map((r) => ({
+    ...r,
+    author: authorMap.get(r.author_id) ?? null,
+    category: categoryMap.get(r.category_id) ?? null,
+  }));
+}
 
 export const listHomeArticles = createServerFn({ method: "GET" }).handler(async () => {
   try {
-    console.log("HOME START");
-
     const { publicClient } = await import("./supabase-public.server");
     const sb = publicClient();
 
-    console.log("SUPABASE OK");
+    const [{ data: featuredRows }, { data: latestRows }, { data: trendingRows }, { data: categories }, { data: authors }] =
+      await Promise.all([
+        sb.from("articles").select(ARTICLE_LIST_COLS).eq("status", "published").eq("is_featured", true).order("published_at", { ascending: false }).limit(1),
+        sb.from("articles").select(ARTICLE_LIST_COLS).eq("status", "published").order("published_at", { ascending: false }).limit(12),
+        sb.from("articles").select(ARTICLE_LIST_COLS).eq("status", "published").order("view_count", { ascending: false }).limit(6),
+        sb.from("categories").select("id, slug, name").limit(20),
+        sb.from("profiles").select("id, username, display_name, avatar_url, bio, reputation").order("reputation", { ascending: false }).limit(6),
+      ]);
 
-    const { data, error } = await sb
-      .from("articles")
-      .select("*")
-      .limit(1);
-
-    console.log("ARTICLES RESULT", {
-      data,
-      error,
-    });
+    const [featured, latest, trending] = await Promise.all([
+      attachMeta(sb, featuredRows ?? []),
+      attachMeta(sb, latestRows ?? []),
+      attachMeta(sb, trendingRows ?? []),
+    ]);
 
     return {
-      featured: null,
-      latest: [],
-      trending: [],
-      categories: [],
-      topAuthors: [],
+      featured: featured[0] ?? null,
+      latest,
+      trending,
+      categories: categories ?? [],
+      topAuthors: authors ?? [],
     };
   } catch (err) {
     console.error("HOME ERROR:", err);
@@ -46,23 +72,49 @@ export const getArticleBySlug = createServerFn({ method: "GET" })
   .handler(async ({ data }) => {
     const { publicClient } = await import("./supabase-public.server");
     const sb = publicClient();
+
+    // 1. Article (no embeds)
     const { data: article } = await sb.from("articles").select(`
       id, slug, title, subtitle, excerpt, content, cover_image_url, status,
       meta_title, meta_description, canonical_url, og_image_url, link_policy,
       reading_time, view_count, like_count, comment_count, published_at, created_at, is_sponsored,
-      category:categories(id, slug, name),
-      author:profiles!articles_author_id_fkey(id, username, display_name, avatar_url, bio, website_url, twitter_handle, linkedin_url)
+      category_id, author_id
     `).eq("slug", data.slug).eq("status", "published").maybeSingle();
     if (!article) return null;
-    const [{ data: tags }, { data: comments }] = await Promise.all([
+
+    // 2. Author + category + tags + comments separately
+    const [{ data: author }, { data: category }, { data: tags }, { data: comments }] = await Promise.all([
+      article.author_id
+        ? sb.from("profiles").select("id, username, display_name, avatar_url, bio, website_url, twitter_handle, linkedin_url").eq("id", article.author_id).maybeSingle()
+        : Promise.resolve({ data: null }),
+      article.category_id
+        ? sb.from("categories").select("id, slug, name").eq("id", article.category_id).maybeSingle()
+        : Promise.resolve({ data: null }),
       sb.from("article_tags").select("tag:tags(id, slug, name)").eq("article_id", article.id),
-      sb.from("comments").select("id, content, created_at, author:profiles!comments_author_id_fkey(username, display_name, avatar_url)").eq("article_id", article.id).eq("is_hidden", false).order("created_at", { ascending: false }),
+      sb.from("comments").select("id, content, created_at, author_id").eq("article_id", article.id).eq("is_hidden", false).order("created_at", { ascending: false }),
     ]);
-    // increment view count (fire and forget)
-    sb.from("article_views").insert({ article_id: article.id }).then(() => {});
-    sb.rpc as any;
+
+    // 3. Comment authors
+    let commentsWithAuthors: any[] = comments ?? [];
+    if (comments && comments.length > 0) {
+      const cAuthorIds = [...new Set(comments.map((c: any) => c.author_id).filter(Boolean))];
+      const { data: cAuthors } = await sb.from("profiles").select("id, username, display_name, avatar_url").in("id", cAuthorIds);
+      const cMap = new Map((cAuthors ?? []).map((p: any) => [p.id, p]));
+      commentsWithAuthors = comments.map((c: any) => ({ ...c, author: cMap.get(c.author_id) ?? null }));
+    }
+
+    // 4. View count (fire-and-forget-ish)
+    await sb.from("article_views").insert({ article_id: article.id });
     await sb.from("articles").update({ view_count: (article.view_count ?? 0) + 1 }).eq("id", article.id);
-    return { ...article, tags: tags?.map((t: any) => t.tag) ?? [], comments: comments ?? [] };
+
+    // 5. Merge
+    return {
+      ...article,
+      author: author ?? null,
+      category: category ?? null,
+      tags: tags?.map((t: any) => t.tag) ?? [],
+      comments: commentsWithAuthors,
+    };
   });
 
 export const listByCategory = createServerFn({ method: "GET" })
@@ -72,8 +124,9 @@ export const listByCategory = createServerFn({ method: "GET" })
     const sb = publicClient();
     const { data: category } = await sb.from("categories").select("*").eq("slug", data.slug).maybeSingle();
     if (!category) return null;
-    const { data: articles } = await sb.from("articles").select(ARTICLE_LIST).eq("status", "published").eq("category_id", category.id).order("published_at", { ascending: false }).limit(30);
-    return { category, articles: articles ?? [] };
+    const { data: rows } = await sb.from("articles").select(ARTICLE_LIST_COLS).eq("status", "published").eq("category_id", category.id).order("published_at", { ascending: false }).limit(30);
+    const articles = await attachMeta(sb, rows ?? []);
+    return { category, articles };
   });
 
 export const listByAuthor = createServerFn({ method: "GET" })
@@ -83,8 +136,9 @@ export const listByAuthor = createServerFn({ method: "GET" })
     const sb = publicClient();
     const { data: profile } = await sb.from("profiles").select("*").eq("username", data.username).maybeSingle();
     if (!profile) return null;
-    const { data: articles } = await sb.from("articles").select(ARTICLE_LIST).eq("status", "published").eq("author_id", profile.id).order("published_at", { ascending: false });
-    return { profile, articles: articles ?? [] };
+    const { data: rows } = await sb.from("articles").select(ARTICLE_LIST_COLS).eq("status", "published").eq("author_id", profile.id).order("published_at", { ascending: false });
+    const articles = await attachMeta(sb, rows ?? []);
+    return { profile, articles };
   });
 
 // ===== Authenticated mutations =====
